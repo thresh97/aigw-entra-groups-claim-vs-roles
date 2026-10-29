@@ -39,6 +39,7 @@ check() {
   need TENANT_ID PUBLIC_CLIENT_ID API_APP_ID_URI TEST_USER_UPN TEST_USER_PASSWORD_FILE EXPECT_GROUP_COUNT EXPECT_ROLE_COUNT
   [[ -r $TEST_USER_PASSWORD_FILE ]] || { echo "ERROR: cannot read TEST_USER_PASSWORD_FILE"; exit 2; }
   for t in curl jq python3; do command -v "$t" >/dev/null || { echo "ERROR: $t not installed"; exit 2; }; done
+  command -v az >/dev/null || echo "note: az not installed; the membership scenario needs it"
   versions; echo "check: ok"; }
 
 claims() { # claims <jwt>: print the payload as JSON
@@ -47,7 +48,7 @@ import sys, base64, json
 raw = sys.stdin.read().strip()
 print(json.dumps(json.loads(base64.urlsafe_b64decode(raw + "=" * ((4 - len(raw) % 4) % 4)))))'; }
 
-SCENARIOS=(claims)
+SCENARIOS=(claims membership)
 describe_claims() { echo "claims: sign in a lab user (ROPC, no MFA) for the API scope and compare the groups and roles claims with the expected counts. Changes: nothing. About 1 min."; }
 scenario_claims() {
   start claims
@@ -64,6 +65,34 @@ scenario_claims() {
   expect "overage markers (_claim_names)" "absent" "$(echo "$c" | jq -r 'if has("_claim_names") then "present" else "absent" end')"
   expect "number of groups in the groups claim" "$EXPECT_GROUP_COUNT" "$(echo "$c" | jq -r '(.groups // []) | length')"
   expect "number of roles in the roles claim" "$EXPECT_ROLE_COUNT" "$(echo "$c" | jq -r '(.roles // []) | length')"
+  finish; }
+
+describe_membership() { echo "membership: sign in a lab user (ROPC, no MFA), list the user's group memberships with az, and compare them with the groups and roles claims: the user is in more groups than the token carries, every groups entry is a real membership, and the counts match. Needs az logged in to the lab tenant. Changes: nothing. About 1 min."; }
+scenario_membership() {
+  need TENANT_ID PUBLIC_CLIENT_ID API_APP_ID_URI TEST_USER_UPN TEST_USER_PASSWORD_FILE EXPECT_GROUP_COUNT EXPECT_ROLE_COUNT EXPECT_MEMBER_GROUP_COUNT
+  command -v az >/dev/null || { echo "ERROR: az not installed (needed to read the user's memberships)"; exit 2; }
+  az account show >/dev/null 2>&1 || { echo "ERROR: az is not logged in; run az login for the lab tenant"; exit 2; }
+  start membership
+  local resp tok c m g
+  resp=$(tr -d '\r\n' < "$TEST_USER_PASSWORD_FILE" | curl -s -X POST "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "grant_type=password" --data-urlencode "client_id=${PUBLIC_CLIENT_ID}" \
+    --data-urlencode "username=${TEST_USER_UPN}" --data-urlencode "password@/dev/stdin" \
+    --data-urlencode "scope=openid profile email ${API_APP_ID_URI}/.default")
+  tok=$(echo "$resp" | jq -r '.access_token // empty')
+  [[ -n $tok ]] || { log "token request failed: $(echo "$resp" | jq -r '.error_description // .error' | mask)"; finish ERROR; return; }
+  c=$(claims "$tok")
+  echo "$c" | jq '{aud, scp, roles, groups, _claim_names}' > "$OUT/claims.json"
+  if ! az ad user get-member-groups --id "$TEST_USER_UPN" --query "[].id" -o tsv 2> "$OUT/az.err" | tr -d '\r' | LC_ALL=C sort > "$OUT/member-groups.txt"; then
+    log "az failed: $(mask < "$OUT/az.err")"; finish ERROR; return; fi
+  echo "$c" | jq -r '(.groups // [])[]' | LC_ALL=C sort > "$OUT/claim-groups.txt"
+  m=$(grep -c . "$OUT/member-groups.txt"); g=$(grep -c . "$OUT/claim-groups.txt")
+  expect "overage markers (_claim_names)" "absent" "$(echo "$c" | jq -r 'if has("_claim_names") then "present" else "absent" end')"
+  expect "groups the user is a member of (az)" "$EXPECT_MEMBER_GROUP_COUNT" "$m"
+  expect "number of groups in the groups claim" "$EXPECT_GROUP_COUNT" "$g"
+  expect "number of roles in the roles claim" "$EXPECT_ROLE_COUNT" "$(echo "$c" | jq -r '(.roles // []) | length')"
+  expect "the token carries fewer groups than the user is in" "true" "$([[ $g -lt $m ]] && echo true || echo false)"
+  expect "groups-claim entries that are not real memberships" "0" "$(LC_ALL=C comm -13 "$OUT/member-groups.txt" "$OUT/claim-groups.txt" | grep -c .)"
   finish; }
 
 # ---------------------------------------------------------------- dispatch (keep as is)
